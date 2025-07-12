@@ -1,0 +1,165 @@
+import sys
+import socket
+import json
+from PyQt5.QtWidgets import (
+    QApplication, QWidget, QLabel, QTextEdit, QVBoxLayout, QPushButton
+)
+from PyQt5.QtCore import QThread, pyqtSignal
+
+# TCP sunucu dinleme işlemi arka planda
+class TCPServer(QThread):
+    veri_alindi = pyqtSignal(dict)
+
+    def run(self):
+        HOST = '0.0.0.0'
+        PORT = 5005
+
+        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server.bind((HOST, PORT))
+        server.listen(5)
+        print("✅ Arayüz sunucu gibi çalışıyor ve dinlemede...")
+
+        while True:
+            conn, addr = server.accept()
+            print("🔗 Bağlantı geldi:", addr)
+            try:
+                data = conn.recv(4096).decode("utf-8")
+                print("📩 Gelen veri:", data)
+                parsed = json.loads(data)
+                self.veri_alindi.emit(parsed)
+            except Exception as e:
+                print("❌ JSON Hatası:", e)
+            finally:
+                conn.close()
+
+# Ana arayüz
+class Arayuz(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("🚗 TCP Tabanlı Araç Arayüzü (Sunucu)")
+        self.setGeometry(300, 200, 650, 550)
+
+        self.label_durum = QLabel("Araç Durumu: Bekleniyor...")
+        self.label_durum.setStyleSheet("font-weight: bold; font-size: 16px; color: gray;")
+
+        self.text_ses = QTextEdit()
+        self.text_komutlar = QTextEdit()
+        self.text_gecmis = QTextEdit()
+
+        self.text_komutlar.setMinimumHeight(60)
+        self.text_ses.setMinimumHeight(60)
+        self.text_gecmis.setMinimumHeight(60)
+
+        self.son_sesli_komut = ""
+        self.son_komutlar = []
+        self.son_gecmis = []
+        self.prev_durum = None
+        self._prev_komutlar = []         # ← önceki batch’i saklayacak
+
+        for box in [self.text_ses, self.text_komutlar, self.text_gecmis]:
+            box.setReadOnly(True)
+            box.setStyleSheet("""
+                background-color: #f9f9f9;
+                border: 1px solid #aaa;
+                border-radius: 6px;
+                font-size: 13px;
+            """)
+
+        layout = QVBoxLayout()
+        layout.addWidget(self.label_durum)
+
+        for label_text, widget in [
+            ("Sesli Komut:", self.text_ses),
+            ("Komutlar:", self.text_komutlar),
+            ("Geçmiş:", self.text_gecmis)
+        ]:
+            label = QLabel(label_text)
+            label.setStyleSheet("font-weight: bold; font-size: 14px; color: #333;")
+            layout.addWidget(label)
+            layout.addWidget(widget)
+
+        # 1) Başlat / Durdur butonları
+        self.btn_start = QPushButton("⏺ Kayıt Başlat")
+        self.btn_stop  = QPushButton("⏹ Kayıt Durdur")
+        self.btn_start.clicked.connect(lambda: self.send_action("start"))
+        self.btn_stop.clicked.connect(lambda: self.send_action("stop"))
+
+        # layout’a ekleyin, mesela label’in altına:
+        layout.insertWidget(1, self.btn_start)
+        layout.insertWidget(2, self.btn_stop)
+
+        self.setLayout(layout)
+
+        # TCP sunucuyu başlat
+        self.server = TCPServer()
+        self.server.veri_alindi.connect(self.guncelle)
+        self.server.start()
+
+    def guncelle(self, veri):
+        # 1) Durum ve lowercase hali
+        durum = veri.get("durum", "")
+        durum_lower = durum.lower()
+
+        # 2) Eğer bu bir yeni batch bildirimi ise, geçmişe yalnızca bir kez ekle
+        if "komutlar alındı" in durum_lower:
+            yeni = [self.yorumla_komut(cmd) for cmd in veri.get("komutlar", [])]
+            # Yeni komutları sırayla üstte olacak şekilde prepend et
+            if yeni:
+                yeni.append("----------------------")  # Ayraç en alta
+            self.son_gecmis = yeni + self.son_gecmis
+            # Önceki batch’i saklayabilirsiniz ki gerekirse
+            self._prev_komutlar = veri.get("komutlar", []).copy()
+            # Geçmiş kutusunu güncelle
+            self.text_gecmis.setText("\n".join(self.son_gecmis))
+
+        # 3) Ekrandaki “Araç Durumu” başlığını güncelle
+        self.label_durum.setText("Araç Durumu: " + self.yorumla_komut(durum))
+
+        # 4) Anlık komutlar paneli
+        if "komutlar" in veri:
+            self.son_komutlar = veri["komutlar"]
+        yorumlu_komutlar = [self.yorumla_komut(c) for c in self.son_komutlar]
+        if "tamamlandı" in durum_lower or "bitti" in durum_lower:
+            yorumlu_komutlar.append("✅ Komutlar tamamlandı.")
+        self.text_komutlar.setText("\n".join(yorumlu_komutlar))
+
+        # 5) Sesli komut paneli
+        if "sesli_komut" in veri:
+            self.son_sesli_komut = veri["sesli_komut"]
+        self.text_ses.setText(self.son_sesli_komut)
+
+    def yorumla_komut(self, komut_str):
+        if komut_str.startswith("engele_kadar_ilerle"):
+            return "Engele kadar ileri git"
+        elif komut_str.startswith("saga_don"):
+            return "Sağa dön"
+        elif komut_str.startswith("sola_don"):
+            return "Sola dön"
+        elif komut_str.startswith("geriye_don"):
+            return "Geriye dön"
+        elif komut_str.startswith("ileri("):
+            sure = komut_str[6:-1]
+            return f"{sure} saniye ileri git"
+        elif komut_str.startswith("geri("):
+            sure = komut_str[5:-1]
+            return f"{sure} saniye geri git"
+        else:
+            return komut_str  # bilinmeyense olduğu gibi yaz
+        
+    def send_action(self, action: str):
+        """Pi’daki TCP sunucuya start/stop komutu yollar."""
+        msg = json.dumps({"action": action})
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.connect(("10.2.132.121", 5005))   # Pi’nin IP’si ve port
+                s.sendall(msg.encode("utf-8"))
+        except Exception as e:
+            print("❌ Action gönderilemedi:", e)
+
+
+# Uygulamayı başlat
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    pencere = Arayuz()
+    pencere.show()
+    sys.exit(app.exec_())

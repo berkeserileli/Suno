@@ -1,0 +1,579 @@
+import re, subprocess, openai, time, json, socket, threading 
+from elevenlabs.client import ElevenLabs
+from elevenlabs import save, play
+import RPi.GPIO as GPIO
+import smbus2 as smbus
+from resemblyzer import VoiceEncoder, preprocess_wav
+import numpy as np
+
+start_event = threading.Event()
+stop_event  = threading.Event()
+TTS_PATH = "response.wav"
+
+# === API KEYS ===
+openai.api_key = "..."
+eleven_client = ElevenLabs(api_key="...")
+
+# === CONSTANTS ===
+HOST = '10.2.130.12'  # Arayuzun IP adresi
+PORT = 5005           # TCP portu (ayni olmali)
+SAMPLE_RATE = 16000
+WAV_PATH = "command.wav"
+TTS_PATH = "tts.wav"
+LOG_PATH = "commands.log"
+VOICE_ID = "pNInz6obpgDQGcFmaJgB"
+THRESHOLD = 0.70
+
+# === GROUP MEMBERS ===
+
+known_embs = {
+    "ali": np.load("embeddings/ali.npy"),
+    "alper": np.load("embeddings/alper.npy"),
+    "eser": np.load("embeddings/eser.npy"),
+    "mert": np.load("embeddings/mert.npy"),
+    "abdullah": np.load("embeddings/abdullah.npy"),
+}
+encoder = VoiceEncoder()
+
+# === COMMAND PATTERN ===
+CMD_PATTERN = re.compile(
+    r'^(?:'
+    r'(?:ileri|geri)\(\d+(?:\.\d+)?\)'
+    r'|(?:saga_don|sola_don|geriye_don|engele_kadar_ilerle)\(\)'
+    r'|Komut anlasilamadi\.'
+    r'|Uzgunum bu komutu gerceklestiremiyorum\.'
+    r')(?:[;\s]+(?:'
+    r'(?:ileri|geri)\(\d+(?:\.\d+)?\)'
+    r'|(?:saga_don|sola_don|geriye_don|engele_kadar_ilerle)\(\)'
+    r'))*$'
+)
+
+def send_to_interface(data):
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.connect((HOST, PORT))
+            s.sendall(json.dumps(data).encode('utf-8'))
+    except Exception as e:
+        print("[TCP ERROR]", e)
+
+def cosine_sim(a, b):
+    return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
+
+def identify_speaker(wav_path, threshold):
+    wav = preprocess_wav(wav_path)
+    emb = encoder.embed_utterance(wav)
+    # en yüksek benzerliği bul
+    name, score = max(
+        ((n, cosine_sim(emb, e)) for n, e in known_embs.items()),
+        key=lambda x: x[1]
+    )
+    return name if score >= threshold else None
+
+def record_by_trigger():
+    """
+    Hem switch (GPIO) hem de TCP üzerinden start/stop bekler.
+    Kayıt birini tetikledi, durdurma da aynı kaynağa bakar.
+    """
+    start_event.clear()
+    stop_event.clear()
+
+    print("[REC] Başlatma bekleniyor (GPIO switch veya TCP START)...")
+    origin = None
+    # 1) hangi kaynaktan başlatıldı, onu yakala
+    while True:
+        if GPIO.input(SENSE_PIN) == GPIO.HIGH:
+            origin = 'switch'
+            break
+        if start_event.is_set():
+            origin = 'tcp'
+            break
+        time.sleep(0.05)
+
+    print(f"[REC] Kayıt {origin} tarafından başlatıldı!")
+    speak("Kayıt başladı!")
+    proc = subprocess.Popen([
+        "arecord", "-D", "hw:3,0",
+        "-f", "S16_LE", "-r", str(SAMPLE_RATE),
+        "-c", "2", "-d", "0", WAV_PATH
+    ])
+
+    # 2) aynı kaynaktan durdurma sinyalini bekle
+    if origin == 'switch':
+        print("[REC] GPIO switch OFF olana kadar bekleniyor...")
+        while GPIO.input(SENSE_PIN) == GPIO.HIGH:
+            time.sleep(0.05)
+    else:
+        print("[REC] TCP STOP komutu gelene kadar bekleniyor...")
+        while not stop_event.is_set():
+            time.sleep(0.05)
+
+    print("[REC] Durduruluyor...")
+    proc.terminate()
+    proc.wait()
+    print(f"[OK] {WAV_PATH} kaydedildi.")
+
+
+
+
+def transcribe_audio():
+    """Whisper API ile sesi metne cevirir (OpenAI v1 API kullanim)."""
+    print("[STT] Transcribing with Whisper API...")
+    with open(WAV_PATH, "rb") as f:
+        resp = openai.audio.transcriptions.create(
+            model="whisper-1", file=f,
+            response_format="text", language="tr"
+        )
+    text = resp  # API `text` formatinda direkt string doner
+    print("Text:", text)
+    return text
+
+
+def interpret_command(text):
+    """Convert free text to vehicle commands or fallback"""
+    tl = text.lower()
+    if re.search(r'\buÃ§\b|\bsÄ±Ã§ra\b', tl):
+        return None, "Uzgunum bu komutu gerceklestiremiyorum."
+
+    prompt = (
+        "Asagidaki serbest metni arac komutlarina donustur:\n"
+        "- ileri(saniye)\n"
+        "- geri(saniye)\n"
+        "- saga_don()\n"
+        "- sola_don()\n"
+        "- geriye_don()\n"
+        "- engele_kadar_ilerle()\n"
+        "Eger cevrilemiyorsa \"Komut anlasilamadi.\" yaz.\n"
+        f"Metin: \"{text}\""
+    )
+    resp = openai.chat.completions.create(
+        model="gpt-4",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.2
+    )
+    cand = resp.choices[0].message.content
+    print("Raw LLM output:", cand)
+
+    # Bu desen aynen fonksiyon imzalarinla eslestir:
+    CMD_REGEX = r'(?:ileri|geri)\(\d+(?:\.\d+)?\)|(?:saga_don|sola_don|geriye_don|engele_kadar_ilerle)\(\)'
+    cmds = re.findall(CMD_REGEX, cand)
+
+    if not cmds:
+        clean = text.strip()  # sondaki '\n' ve fazlaliklari kaldir
+        return None, f"Komut anlaşılamadı: {clean}"
+
+    seq = ";".join(cmds)
+    print("Parsed command sequence:", seq)
+    return seq, None
+
+
+def speak(text):
+    print("[TTS]", text)
+    audio_stream = eleven_client.text_to_speech.convert(
+        voice_id=VOICE_ID,
+        model_id="eleven_multilingual_v2", text=text
+    )
+    audio_bytes = b"".join(audio_stream)
+    with open("raw_tt.wav", "wb") as f:
+        f.write(audio_bytes)
+    subprocess.run(
+        ["ffmpeg", "-y", "-loglevel", "quiet", "-i", "raw_tt.wav",
+         "-ar", str(SAMPLE_RATE), "-ac", "2", "-sample_fmt", "s16", TTS_PATH],
+        check=True
+    )
+    subprocess.run(
+        ["aplay", "-q", "-D", "hw:3,0", "-c", "2", TTS_PATH],
+        check=True
+    )
+
+
+def append_to_log(entry):
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    with open(LOG_PATH, "a", encoding="utf-8") as f:
+        f.write(f"{ts}  {entry}\n")
+
+
+def llm():
+    speak("Hazırım")
+    send_to_interface({
+            "durum": "Komut bekleniyor...",
+        })
+    record_by_trigger()
+    speak("tamamlandı")
+
+    speaker = identify_speaker(WAV_PATH, THRESHOLD)
+    if speaker is None:
+        # grup dışıysa reddet
+        speak("Tanıyamadım")
+        return None,None # ya da sys.exit(1)
+    else:
+        speak(f"{speaker} bey hoşgeldiniz")
+
+    user_text = transcribe_audio()
+    if not user_text:
+        fb = "Komutlar anlaşılamadı."
+        print(fb)
+        speak(fb)
+        exit(1)
+
+    seq, fb = interpret_command(user_text)
+    if seq:
+        for part in seq.split(";"):
+            part = part.strip()
+            if not part:
+                continue
+            m = re.match(r'(\w+)\((.*?)\)', part)
+            name, arg = m.groups() if m else (None, None)
+            time.sleep(float(arg) if name in ("ileri", "geri") else 1)
+        append_to_log(f"CMD: {seq}")
+    else:
+        print(fb)
+        speak(fb)
+        append_to_log(f"FB: {fb}")
+    commands = [p.strip() for p in seq.split(";") if p.strip()] if seq else []
+    if commands and user_text:
+        return commands, user_text
+    else:
+        return None, None
+
+# --------------------------- Pin --------------------------- #
+LEFT_IN1, LEFT_IN2 = 16, 13
+RIGHT_IN1, RIGHT_IN2 = 18, 37
+LEFT_EN, RIGHT_EN = 32, 33
+# eskiden varsa SW_PIN, START_PIN falan sil, aay ekle:
+DRIVE_PIN  = 38 
+SENSE_PIN  = 40   
+
+TRIG, ECHO = 29, 31
+PWM_FREQ = 500
+CRIT_DIST = 20
+MAX_DIST = 400
+
+# GPIO setup
+GPIO.setwarnings(False)
+GPIO.setmode(GPIO.BOARD)
+GPIO.setup([LEFT_IN1, LEFT_IN2, RIGHT_IN1, RIGHT_IN2, TRIG, LEFT_EN, RIGHT_EN, DRIVE_PIN], GPIO.OUT)
+GPIO.setup(ECHO, GPIO.IN)
+# switch srcs / okuyucusu
+GPIO.setup(DRIVE_PIN, GPIO.OUT)
+GPIO.output(DRIVE_PIN, GPIO.HIGH)            # sabit 3.3V veriyoruz
+GPIO.setup(SENSE_PIN, GPIO.IN, pull_up_down=GPIO.PUD_DOWN)
+
+# MPU6050 Gyro Sensor
+MPU_ADDR = 0x68
+PWR_MGMT_1 = 0x6B
+GYRO_Z_H = 0x47
+bus = smbus.SMBus(1)
+bus.write_byte_data(MPU_ADDR, PWR_MGMT_1, 0)
+angle = 0
+last_time = time.time()
+
+# PWM objects
+pwm_left = GPIO.PWM(LEFT_EN, PWM_FREQ)
+pwm_right = GPIO.PWM(RIGHT_EN, PWM_FREQ)
+pwm_left.start(0)
+pwm_right.start(0)
+
+# Motor functions
+def drive(direction, speed, duration_s):
+    Kp, Ki, Kd = 8, 200, 0
+
+    duty_base = max(0, min(100, speed))
+    integral, last_error = 0.0, 0.0
+    GPIO.output([LEFT_IN1, LEFT_IN2, RIGHT_IN1, RIGHT_IN2], GPIO.LOW)
+
+    # Set motors for forward/backward
+    if direction == 'ileri':
+        GPIO.output([LEFT_IN1, RIGHT_IN1], GPIO.LOW)
+        GPIO.output([LEFT_IN2, RIGHT_IN2], GPIO.HIGH)
+    elif direction == 'geri':
+        turn_around(100)
+        GPIO.output([LEFT_IN1, RIGHT_IN1], GPIO.LOW)
+        GPIO.output([LEFT_IN2, RIGHT_IN2], GPIO.HIGH)
+    else:
+        stop()
+        return
+
+    # Açı entegrasyonunu sıfırla
+    global angle, last_time
+    angle = 0.0
+    last_time = time.time()
+    pwm_left.ChangeDutyCycle(duty_base)
+    pwm_right.ChangeDutyCycle(duty_base)
+    start = time.time()
+    # Eger duration_s belirtilmisse, sure icinde periyodik engel kontrolu yap
+    if duration_s is not None:
+        while True:
+            # Engel olcumu
+            dist = measure_distance_cm()
+            if dist is not None and dist <= CRIT_DIST:
+                print(f"Engel algilandi ({dist} cm), durduruluyor.")
+                break
+            # Sure dolduysa cik
+            now = time.time()
+            if now - start >= duration_s:
+                break
+
+            # PID için hata = mevcut açı (derece cinsinden, pozitif sağa sapma diyelim)
+            current_angle = update_angle()
+            error     = current_angle
+            dt        = now - last_time
+            integral += error * dt
+            derivative = (error - last_error) / (dt if dt>0 else 1e-6)
+            last_error = error
+            last_time  = now
+
+            # PID düzeltme
+            correction = Kp * error + Ki * integral + Kd * derivative
+
+            # Sol/sağ hızları düzelt
+            left_duty  = max(0, min(100, duty_base - correction))
+            right_duty = max(0, min(100, duty_base + correction))
+
+            pwm_left.ChangeDutyCycle(left_duty)
+            pwm_right.ChangeDutyCycle(right_duty)
+
+            # Bir sonraki döngüye
+            time.sleep(0.005)
+            # açı güncellensin
+            
+    else:
+        return None
+
+    stop()
+
+def stop():
+    pwm_left.ChangeDutyCycle(0)
+    pwm_right.ChangeDutyCycle(0)
+    GPIO.output([LEFT_IN1, LEFT_IN2, RIGHT_IN1, RIGHT_IN2], GPIO.LOW)
+
+def turn_right(speed):
+    global angle, last_time
+    # Her donus oncesi aci ve zamanlayiciyi sifirliyoruz
+    angle = 0
+    last_time = time.time()
+    # Simdi start_angle her zaman 0 olacak
+    start_angle = update_angle()       
+    target_angle = start_angle - 84.5  
+    duty = max(0, min(100, speed))
+    GPIO.output(RIGHT_IN2,GPIO.HIGH) #SOL ILERI
+    GPIO.output(RIGHT_IN1,GPIO.LOW)
+    GPIO.output(LEFT_IN1,GPIO.HIGH) #SAG GERI
+    GPIO.output(LEFT_IN2,GPIO.LOW)
+    pwm_left.ChangeDutyCycle(duty)
+    pwm_right.ChangeDutyCycle(duty)
+    # Donusu takip et, 2 icinde dur
+    while True:
+        current_angle = update_angle()
+        if abs(target_angle - current_angle) < 2:
+            break
+        time.sleep(0.005)
+    stop()
+
+def turn_left(speed):
+    global angle, last_time
+    # Her donusten once aci ve zamanlayici sifirlaniyor
+    angle = 0
+    last_time = time.time()
+    target_angle = 85.0
+
+    duty_left = max(0, min(100, speed))
+    duty_right = max(0, min(100, speed))
+    GPIO.output(RIGHT_IN1, GPIO.HIGH)  # SOL GERI
+    GPIO.output(RIGHT_IN2, GPIO.LOW)
+    GPIO.output(LEFT_IN1, GPIO.LOW)    # SAG ILERI
+    GPIO.output(LEFT_IN2, GPIO.HIGH)
+    pwm_left.ChangeDutyCycle(duty_left)
+    pwm_right.ChangeDutyCycle(duty_right)
+    # Donusu takip et, 2 icinde dur
+    while True:
+        current_angle = update_angle()
+        if abs(target_angle - current_angle) < 2:
+            break
+        time.sleep(0.01)
+    stop()
+
+def engele_kadar_ilerle():
+    drive('ileri', speed=70, duration_s=100)
+
+def turn_around(speed=100):   #EtrafÄ±nda 180 derece dundur saga sogru
+    global angle, last_time
+    angle = 0
+    last_time = time.time()
+    start_angle = update_angle()
+    target_angle = start_angle - 180.0
+    
+    duty = max(0, min(100, speed))
+    GPIO.output(RIGHT_IN2, GPIO.HIGH)  # SOL ILERI
+    GPIO.output(RIGHT_IN1, GPIO.LOW)
+    GPIO.output(LEFT_IN1, GPIO.HIGH)   # SAG GERI
+    GPIO.output(LEFT_IN2, GPIO.LOW)
+    pwm_left.ChangeDutyCycle(duty)
+    pwm_right.ChangeDutyCycle(duty)
+
+    # Hedef aci: 180 derece
+    while True:
+        current_angle = update_angle()
+        if ((174 <= current_angle) | (-174 >= current_angle)):
+            break
+        time.sleep(0.005)
+    stop()
+
+def measure_distance_cm():
+    GPIO.output(TRIG, GPIO.LOW)
+    time.sleep(0.05)
+    GPIO.output(TRIG, GPIO.HIGH)
+    time.sleep(0.00001)
+    GPIO.output(TRIG, GPIO.LOW)
+
+    time_start = time.time()
+    while GPIO.input(ECHO) == 0:
+        if time.time() - time_start > 0.1:
+          return None
+
+    pulse_start = time.time()
+    while GPIO.input(ECHO) == 1:
+        if time.time() - pulse_start > 0.1:
+          return None
+    
+    pulse_end = time.time()
+    duration = pulse_end - pulse_start
+    return round(duration * 17150)  # Ses hizi boslukta 343 m/s
+
+def read_gyro_z():
+    try:
+        high_byte = bus.read_byte_data(MPU_ADDR, GYRO_Z_H)
+        low_byte = bus.read_byte_data(MPU_ADDR, GYRO_Z_H + 1)
+        value = (high_byte << 8) | low_byte
+        if value >= 0x8000:
+            value = -((65535 - value) + 1)
+        return value
+    except OSError as e:
+        print("[MPU6050] I2C okuma hatasi (read_gyro_z):", e)
+        return 0  
+    except Exception as e:
+        print("[MPU6050] Genel hata (read_gyro_z):", e)
+        return 0
+
+def gyro_calibration_z(samples=500):
+    print("Gyro  kalibrasyonu yapiliyor...")
+    total = 0
+    for _ in range(samples):
+        total += read_gyro_z()
+        time.sleep(0.002)
+    bias = total / samples
+    print(f"Offset (bias): {bias:.2f}")
+    return bias
+
+def update_angle():
+    global angle, last_time
+    try:
+        now = time.time()
+        dt = now - last_time
+        last_time = now
+
+        deg_s = (read_gyro_z() - bias) / 131.0
+        angle += deg_s * dt     # 360 modunu kaldir
+        return angle
+    except Exception as e:
+        #print("Aci guncelleme hatasi!", e)
+        return angle  # Mevcut aciyi koru
+
+def execute_commands(raw_cmds, user_text):
+    for cmd in raw_cmds:
+        send_to_interface({
+            "durum": f"{cmd}" if raw_cmds else "hareket etmiyor",
+        })
+        m = re.match(r'(\w+)\((.*?)\)', cmd)
+        if not m:
+            continue
+        name, arg = m.groups()
+        if name == "ileri":
+            speak(f"{arg} saniye ileri gidiyorum.")
+        elif name == "geri":
+            speak(f"{arg} saniye geri gidiyorum.")
+        elif name == "saga_don":
+            speak("Sağa dönüyorum.")
+        elif name == "sola_don":
+            speak("Sola dönüyorum.")
+        elif name == "engele_kadar_ilerle":
+            speak("Engel algılayana kadar ilerliyorum.")
+        elif name == "geriye_don":
+            speak("Geriye dönüyorum.")
+        
+        else:
+            speak("Bilinmeyen komut.")
+        if name in ["ileri", "geri"]:
+            drive(name, speed=70, duration_s=float(arg))
+        elif name == "saga_don":
+            turn_right(speed=100)
+        elif name == "sola_don":
+            turn_left(speed=100)
+        elif name == "engele_kadar_ilerle":
+            engele_kadar_ilerle()
+        elif name == "geriye_don":
+            turn_around(speed=100)
+        time.sleep(0.1)
+    if raw_cmds:
+        # hepsi bittiğinde final durumu da aynı payloaında:
+        send_to_interface({
+            "durum": "Komutlar tamamlandı",
+            "komutlar": raw_cmds,
+            "sesli_komut": user_text
+        })
+        speak("Komutlar tamamlandı.")
+
+def tcp_listener():
+    HOST, PORT = '0.0.0.0', 5005
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.bind((HOST, PORT))
+    srv.listen(1)
+    print("TCP listener başlatıldı, start/stop bekleniyor...")
+
+    while True:
+        conn, _ = srv.accept()
+        try:
+            data = conn.recv(4096).decode('utf-8')
+            payload = json.loads(data)
+            action = payload.get("action", "").lower()
+            if action == "start":
+                start_event.set()
+                stop_event.clear()
+                # Arayüze “kayıt başladı” bildirimi gönder
+                send_to_interface({"durum": " Kayıt başladı"})
+            elif action == "stop":
+                stop_event.set()
+                start_event.clear()
+                # Arayüze “kayıt bitti” bildirimi gönder
+                send_to_interface({"durum": " Kayıt bitti"})
+        except Exception as e:
+            print("[TCP_LISTENER ERROR]", e)
+        finally:
+            conn.close()
+
+
+print("Kalibrasyon basliyor!")
+time.sleep(3)
+bias = gyro_calibration_z()
+print("Kalibrasyon tamamlandi!")
+angle = 0.0
+last_time = time.time()
+
+if __name__ == "__main__":
+    t = threading.Thread(target=tcp_listener, daemon=True)
+    t.start()
+    try:
+        while True:
+            raw_cmds, user_text = llm()
+            if not raw_cmds or not user_text:
+                continue
+            send_to_interface({
+                    "durum": "Komutlar alındı!",
+                    "komutlar": raw_cmds,
+                    "sesli_komut": user_text
+            })
+            execute_commands(raw_cmds, user_text)
+            # Sonra bir dahaki start için bekle
+    except KeyboardInterrupt:
+        pass
+    finally:
+        stop()            
